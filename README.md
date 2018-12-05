@@ -1,5 +1,5 @@
 # CV_AR_Pikachu
-Augmented Reality Realization with OpenCV
+Augmented Reality Implementation with OpenCV and OpenGl in Python (Sample Jave code with vision implementation also included)
 
 The goal of this project is to conduct pose estimation of a 2D textured flat surface with OpenCV computer vision package. An augmented reality effect is realized by overlaying a 3D Pikachu model using the estimated pose.
 
