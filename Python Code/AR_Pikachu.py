@@ -1,0 +1,229 @@
+# Augmented reality Pikachu overlay with provided picture
+# Implementation with Opengl and Opencv in Python 3.5
+# Author: Fangzhou Xia <xiafz@mit.edu>, Yingnan Cui <yncui@mit.edu>
+
+# Depedency installation with conda
+#
+# conda create -n cv_env pip python=3.5
+# conda activate cv_env
+# conda install jupyter
+# pip install opencv-python
+# pip install PyOpenGL PyOpenGL_accelerate
+# pip install pygame
+# pip install pillow
+
+
+import os
+import sys, pygame
+from pygame.locals import *
+from pygame.constants import *
+from OpenGL.GL import *
+from OpenGL.GLU import *
+import cv2
+import numpy as np
+from PIL import Image
+from PIL import ImageOps
+from objloader import * #custom class for loading obj models with Opengl
+
+# Begin of main program 
+
+# Setup name of reference image must be in same folder as the script
+img = cv2.imread("box2.png", cv2.IMREAD_GRAYSCALE) # queryiamge
+# Setup global scaling parameter
+scene_scaling = 2       
+# Initialize filter length
+queue_depth = 10
+# Initialize video capture device
+cap = cv2.VideoCapture(0)
+
+
+# Do not change code below
+# Initialize filter
+rvec_queue = np.zeros(shape=(queue_depth,3))
+tvec_queue = np.zeros(shape=(queue_depth,3))
+# Setup planar shape of the reference image to be used by cv2.solvePnP
+track_y, track_x = img.shape[:2]
+x_start = 0
+y_start = 0
+x_end = track_x - 1
+y_end = track_y - 1
+track_quad = np.float32([[x_start, y_start], [x_end, y_start], [x_end, y_end], [x_start, y_end]])
+# Setup 3D position of the 3D model with Pikachu base maped to center of the reference imageto be used by cv2.solvePnP
+quad_x_start = x_start - x_end/2
+quad_x_end = x_end - x_end/2
+quad_y_start = y_start - y_end/2
+quad_y_end = y_end - y_end/2
+track_quad_3d = np.float32([[quad_x_start, quad_y_start, 0], [quad_x_end, quad_y_start, 0], [quad_x_end, quad_y_end, 0], [quad_x_start, quad_y_end, 0]]) 
+
+# Initialize feature detector
+detector = cv2.ORB_create()
+kp_image, desc_image = detector.detectAndCompute(img, None)
+ 
+# Setup feature mature
+index_params = dict(algorithm=0, trees=5)
+search_params = dict()
+flann_params = dict(algorithm=6, table_number=6, key_size=12, multi_probe_level=1)
+flann = cv2.FlannBasedMatcher(flann_params, {}) 
+
+# Start Pygame and setup vieo points
+pygame.init()
+viewport = (800,600)
+hx = viewport[0]/2
+hy = viewport[1]/2
+srf = pygame.display.set_mode(viewport, OPENGL | DOUBLEBUF)
+clock = pygame.time.Clock()
+# Load object after the initialization
+dirname = os.path.dirname(__file__)
+filename = os.path.join(dirname, 'obj/obj_pikachu/pikachu.obj')
+obj = OBJ("pikachu.obj", swapyz=True)
+
+# Setup opengl
+glMatrixMode(GL_PROJECTION)
+width, height = viewport
+gluPerspective(90.0, width/float(height), 1, 100.0*scene_scaling)
+glEnable(GL_DEPTH_TEST)
+glMatrixMode(GL_MODELVIEW)
+texture_background = glGenTextures(1)
+glLoadIdentity()
+
+
+# Capture 1 image to get camera resolution
+_, frame = cap.read()
+size_image = Image.fromarray(frame)
+
+# Define video recorder  
+frame_number = 0
+fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Be sure to use lower case
+video_recorder = cv2.VideoWriter("AR_Pikachu_video.mp4", fourcc, 20.0, (width, height))
+video_homography = cv2.VideoWriter("AR_Homography_video.mp4", fourcc, 20.0, (size_image.size[0], size_image.size[1]))
+# Start the main loop
+while True:
+    #clock.tick(25) #not used now
+
+    #check if we quit
+    for e in pygame.event.get():
+        if e.type == QUIT:
+            sys.exit()
+        elif e.type == KEYDOWN and e.key == K_ESCAPE:
+            sys.exit()
+
+    # clear the scene
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)    
+    # Read a frame
+    _, frame = cap.read()
+    
+    # Prepare image to be used as opengl texture
+    image = cv2.flip(frame, 0)
+    gl_image = Image.fromarray(frame)
+    ix = gl_image.size[0]
+    iy = gl_image.size[1]
+    print(ix)
+    print(iy)
+    gl_image = gl_image.tobytes("raw", "BGRX", 0, -1)
+
+    #process image to get transfer matrix of the object of interest
+    grayframe = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
+    kp_grayframe, desc_grayframe = detector.detectAndCompute(grayframe, None)
+    matches = flann.knnMatch(desc_image, desc_grayframe, k=2)
+    good_points = []
+    good_points = [match[0] for match in matches if len(match) == 2 and match[0].distance < match[1].distance * 0.75]
+    #print(len(matches))
+
+    # Execute pose estimation if enough matches found
+    if len(good_points) > 10:
+        query_pts = np.float32([kp_image[m.queryIdx].pt for m in good_points]).reshape(-1, 1, 2)
+        train_pts = np.float32([kp_grayframe[m.trainIdx].pt for m in good_points]).reshape(-1, 1, 2)
+        # Find homography matrix
+        matrix, mask = cv2.findHomography(query_pts, train_pts, cv2.RANSAC, 5.0)       
+        # Define camera matrix        
+        h, w = frame.shape[:2]
+        K = np.float64([[w, 0, 0.5*(w-1)], 
+                        [0, w, 0.5*(h-1)], 
+                        [0, 0, 1.0]]) 
+        dist_coef = np.zeros(4)
+        # Apply homography matrix to 2D reference image
+        quad_in_image = cv2.perspectiveTransform(track_quad.reshape(1, -1, 2), matrix).reshape(-1, 2)
+        # Obtain 3D orientation of the base of Pikachu
+        ret, rvec, tvec = cv2.solvePnP(track_quad_3d, quad_in_image, K, dist_coef) 
+        # Apply FIFO operation to the queue
+        rvec_queue = np.roll(rvec_queue, 1, axis=0)
+        tvec_queue = np.roll(tvec_queue, 1, axis=0)
+        
+        # Update the value
+        rvec_queue[0,0] = rvec[0]
+        rvec_queue[0,1] = rvec[1]
+        rvec_queue[0,2] = rvec[2]
+        tvec_queue[0,0] = tvec[0]
+        tvec_queue[0,1] = tvec[1]
+        tvec_queue[0,2] = tvec[2]
+        rvec_filtered = np.median(rvec_queue,axis=0)
+        tvec_filtered = np.median(tvec_queue,axis=0)
+        
+        # Overlay rectangle setup in opencv for comparison
+        h1, w1 = img.shape
+        pts = np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2)
+        dst = cv2.perspectiveTransform(pts, matrix)
+        # Overlay the rectangle
+        homography = cv2.polylines(frame, [np.int32(dst)], True, (255, 0, 0), 3)
+        cv_show = homography 
+    else:
+        # Set color to red for opengl and grey for opencv if no match found
+        glColor3f(1, 0, 0);
+        cv_show = grayframe        
+        rotation_vector = [0, 0, 0]
+        theta = 0
+
+    # Start computation for plotting
+    rvec_filtered = np.median(rvec_queue,axis=0)
+    tvec_filtered = np.median(tvec_queue,axis=0)    
+    theta = np.linalg.norm(rvec_filtered)
+    r = np.divide(rvec_filtered, theta)
+    # Create background texture
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, texture_background)
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+    glTexImage2D(GL_TEXTURE_2D, 0, 3, ix, iy, 0, GL_RGBA, GL_UNSIGNED_BYTE, gl_image)    
+    glBindTexture(GL_TEXTURE_2D, texture_background)
+    # Draw the background camera image
+    glPushMatrix()
+    glBegin(GL_QUADS)
+    glTexCoord2f(1.0, 1.0); glVertex3f( 80.0*scene_scaling, 60*scene_scaling, -60*scene_scaling)
+    glTexCoord2f(0.0, 1.0); glVertex3f( -80.0*scene_scaling, 60.0*scene_scaling, -60*scene_scaling)
+    glTexCoord2f(0.0, 0.0); glVertex3f(-80.0*scene_scaling,  -60.0*scene_scaling, -60*scene_scaling)
+    glTexCoord2f(1.0, 0.0); glVertex3f( 80.0*scene_scaling,  -60.0*scene_scaling, -60*scene_scaling)    
+    glEnd( )
+    glPopMatrix()
+    glDisable(GL_TEXTURE_2D)
+    glColor3f(1, 1, 1);
+    
+    #Start the drawing of Pikachu    
+    glPushMatrix()
+    # Translate Pikachu
+    glTranslate(tvec_filtered[0]/6.5*scene_scaling, -tvec_filtered[1]/6.5*scene_scaling, -25-tvec_filtered[2]/30*scene_scaling)
+    # Rotate Pikachu
+    glRotate(theta/3.1415*180,r[0],-r[1],-r[2])
+    #move the Pikachu to face the user
+    glRotate(-90, 1, 0, 0)
+    glRotate(180, 0, 0, 1)
+    # Load Pikachu into the scene
+    glCallList(obj.gl_list)
+    glPopMatrix()
+    # Show the image in opencv
+    cv2.imshow("Image", cv_show)
+
+        
+    buf = glReadPixels(0,0,800,600,GL_RGB,GL_BYTE)
+    record_img = Image.frombuffer('RGB',(800,600),buf)
+    # Optional record frame sequence functionality
+    # Comment out to improve frame rate
+    # record_img2 = ImageOps.flip(img)
+    # frame_number += 1
+    # record_img.save('recording/frame%06i.png'%(frame_number))
+    video_recorder.write(cv2.cvtColor(np.array(record_img), cv2.COLOR_BGR2RGB))
+    video_homography.write(cv_show)
+    
+    pygame.display.flip()
+
+cap.release()
+cv2.destroyAllWindows()
